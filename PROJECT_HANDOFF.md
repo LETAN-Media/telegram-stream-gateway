@@ -8,17 +8,13 @@
   đã PUSH main (Northflank CI/CD tự deploy, live xác nhận qua /v1/cache-status 404→403).
 - Bug `object_key` 3-args đã FIX (2 args đồng bộ) — cache-status production trả 200/MISS, KHÔNG 500.
 - Regression streaming cũ: KHÔNG (HEAD 200 + Range 206 start/end qua worker đã verify sau deploy).
-- **BLOCKER HIỆN TẠI: Northflank runtime THIẾU R2 ENV.**
-  Bằng chứng: POST /v1/cache/... → {"cache":"DISABLED"} (mirror tự tắt, gateway vẫn RUNNING —
-  đúng thiết kế fail-safe). Cần thêm vào Northflank Service → Environment:
-  - R2_NEW_ENDPOINT
-  - R2_NEW_ACCESS_KEY_ID
-  - R2_NEW_SECRET_ACCESS_KEY
-  - R2_NEW_BUCKET (= web-phim-videos)
-  Giá trị có sẵn trong /root/web-phim/.env (R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
-  R2_BUCKET) — KHÔNG commit, KHÔNG log.
-- Sau khi thêm ENV + restart: chạy `python3 scripts/test_mirror_e2e.py` (script test an toàn,
-  không in secret) → kỳ vọng MISS → CACHING → READY (video 92MB mất vài phút).
+- **R2 ENV ĐÃ SET (2026-09-20 22:23 UTC)** qua Northflank API POST /runtime-environment
+  (4 biến R2_NEW_* — không in giá trị). Service redeploy COMPLETED, healthz xanh.
+- **MIRROR E2E PASS:** mid=25 (92MB): STARTED → CACHING → READY ~4 phút; mid=23 (180MB) READY
+  (trigger tự động từ Worker khi R2 MISS). R2 ContentLength == Telegram size cả hai.
+  R2 metadata đầy đủ (chat/message/file_size/filename/cached_at/storage_source).
+- Worker (web-phim e23d276+) giờ gọi POST /v1/cache khi R2 MISS — flow persistent cache hoàn chỉnh.
+- Pre-cache CLI bên web repo: scripts/cache_video.py (signed, --wait).
 
 ## Vai trò
 

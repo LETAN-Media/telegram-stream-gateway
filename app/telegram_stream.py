@@ -58,13 +58,16 @@ async def _get_file_bytes(
     limit: int,
     timeout: float,
 ) -> bytes:
-    from telethon.tl.functions.upload import GetFile
+    try:
+        from telethon.tl.functions.upload import GetFileRequest as _GetFile
+    except ImportError:  # Telethon < 1.37 class name
+        from telethon.tl.functions.upload import GetFile as _GetFile  # type: ignore[no-redef]
 
     last_error: Exception | None = None
     for attempt in range(1, MAX_FLOOD_RETRIES + 2):
         try:
             result = await asyncio.wait_for(
-                client(GetFile(location=location, offset=offset, limit=limit, precise=False)),
+                client(_GetFile(location=location, offset=offset, limit=limit, precise=False)),
                 timeout,
             )
             return bytes(result.bytes)

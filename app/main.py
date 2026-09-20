@@ -93,22 +93,25 @@ def _base_headers(info: object, size: int) -> dict[str, str]:
     }
 
 
-async def _resolve_document(client: object, chat_id: int, message_id: int):
+async def _startup_warm(cfg: Settings, holder: dict) -> None:
+    """Connect MTProto at startup and warm the DC connection.
+
+    Never fails startup: on error the client stays lazy (first request
+    connects). Keeps Northflank healthchecks green while Telegram is down.
+    """
+    if not cfg.telegram_configured:
+        log.warning("telegram not configured; video endpoints will return 503")
+        return
     try:
-        entity = await client.get_entity(chat_id)
-    except Exception:
-        return None
+        client = await _get_client(cfg, holder)
+    except Exception as e:
+        log.warning("startup connect failed (lazy retry on request): %s", type(e).__name__)
+        return
     try:
-        msg = await client.get_messages(entity, ids=message_id)
-    except Exception:
-        return None
-    if msg is None:
-        return None
-    media = getattr(msg, "media", None)
-    doc = getattr(media, "document", None) if media else None
-    if doc is None or int(getattr(doc, "size", 0) or 0) <= 0:
-        return None
-    return doc
+        me = await client.get_me()
+        log.info("telegram connected, warmed DC (as=%s)", getattr(me, "username", "?"))
+    except Exception as e:
+        log.warning("telegram warm failed (lazy retry on request): %s", type(e).__name__)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -122,6 +125,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        await _startup_warm(cfg, holder)
         yield
         client = holder["client"]
         if client is not None:
@@ -149,10 +153,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception as e:
             log.error("telegram connect failed: %s", type(e).__name__)
             return None, _error(502, "telegram unavailable")
-        doc = await _resolve_document(client, chat_id, message_id)
-        if doc is None:
+        media = await telegram_stream.get_cached_media(client, chat_id, message_id)
+        if media is None:
             return None, _error(404, "video not found")
-        return (client, doc), None
+        return (client, media), None
 
     @app.head("/v1/video/{chat_id}/{message_id}")
     async def video_head(chat_id: int, message_id: int, request: Request):
@@ -162,11 +166,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         resolved, err = await _media_or_error(chat_id, message_id)
         if err is not None:
             return err
-        _, doc = resolved
-        size = int(doc.size)
-        info = await telegram_stream.get_media_info(holder["client"], chat_id, message_id)
-        headers = _base_headers(info or doc, size)
-        headers["Content-Length"] = str(size)
+        _, media = resolved
+        headers = _base_headers(media, media.size)
+        headers["Content-Length"] = str(media.size)
         return JSONResponse(None, status_code=200, headers=headers)
 
     @app.get("/v1/video/{chat_id}/{message_id}")
@@ -189,10 +191,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         resolved, err = await _media_or_error(chat_id, message_id)
         if err is not None:
             return err
-        client, doc = resolved
-        size = int(doc.size)
-        info = await telegram_stream.get_media_info(client, chat_id, message_id)
-        base = _base_headers(info or doc, size)
+        client, media = resolved
+        size = media.size
+        base = _base_headers(media, size)
 
         raw_range = request.headers.get("range")
         try:
@@ -212,13 +213,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async def body():
             try:
                 async for chunk in telegram_stream.iter_media_range(
-                    client, doc, wanted.start, wanted.end, cfg.telegram_chunk_size, cfg.request_timeout_seconds
+                    client, media, wanted.start, wanted.end, cfg.telegram_chunk_size, cfg.request_timeout_seconds
+                ):
+                    yield chunk
+                return
+            except GeneratorExit:
+                return
+            except Exception as e:
+                if not telegram_stream.is_file_reference_error(e):
+                    log.error("stream failed: %s", type(e).__name__)
+                    return
+            log.warning("file reference expired; re-resolving once")
+            telegram_stream.invalidate_metadata(chat_id, message_id)
+            fresh = await telegram_stream.get_cached_media(client, chat_id, message_id)
+            if fresh is None:
+                return
+            try:
+                async for chunk in telegram_stream.iter_media_range(
+                    client, fresh, wanted.start, wanted.end, cfg.telegram_chunk_size, cfg.request_timeout_seconds
                 ):
                     yield chunk
             except GeneratorExit:
                 return
             except Exception as e:
-                log.error("stream failed: %s", type(e).__name__)
+                log.error("stream retry failed: %s", type(e).__name__)
                 return
 
         headers = dict(base)

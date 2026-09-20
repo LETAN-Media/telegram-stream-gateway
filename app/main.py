@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 
@@ -136,6 +137,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="telegram-stream-gateway", lifespan=lifespan)
 
+    from .r2_mirror import MirrorManager, object_key, r2_settings_from_env
+
+    mirror = MirrorManager(r2_settings_from_env(dict(os.environ)))
+
     @app.get("/healthz")
     async def healthz():
         connected = holder["client"] is not None
@@ -144,6 +149,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "telegram_connected": connected,
             "telegram_configured": cfg.telegram_configured,
         }
+
+    @app.post("/v1/cache/{chat_id}/{message_id}")
+    async def cache_trigger(chat_id: int, message_id: int, request: Request):
+        denied = _check_auth(cfg, chat_id, message_id, request)
+        if denied is not None:
+            return denied
+        if not cfg.telegram_configured:
+            return _error(503, "telegram not configured")
+        try:
+            client = await _get_client(cfg, holder)
+        except Exception as e:
+            log.error("telegram connect failed: %s", type(e).__name__)
+            return _error(502, "telegram unavailable")
+        state = mirror.trigger(client, chat_id, message_id, telegram_stream.get_cached_media)
+        return JSONResponse({"ok": True, "cache": state})
+
+    @app.get("/v1/cache-status/{chat_id}/{message_id}")
+    async def cache_status(chat_id: int, message_id: int, request: Request):
+        denied = _check_auth(cfg, chat_id, message_id, request)
+        if denied is not None:
+            return denied
+        if not cfg.telegram_configured:
+            return _error(503, "telegram not configured")
+        try:
+            client = await _get_client(cfg, holder)
+        except Exception:
+            return _error(502, "telegram unavailable")
+        media = await telegram_stream.get_cached_media(client, chat_id, message_id)
+        if media is None:
+            return _error(404, "video not found")
+        key = object_key(chat_id, message_id)
+        found = await mirror.head_size(key)
+        if found == int(media.size):
+            return JSONResponse({"ok": True, "state": "READY", "size": found, "key": key})
+        job = mirror.job_state(chat_id, message_id)
+        if job is not None and job.state in ("CACHING", "FAILED", "SKIPPED"):
+            return JSONResponse({"ok": True, "state": job.state, "size": int(media.size),
+                                 "error": job.error, "key": key})
+        return JSONResponse({"ok": True, "state": "MISS", "size": int(media.size), "key": key})
 
     async def _media_or_error(chat_id: int, message_id: int):
         if not cfg.telegram_configured:

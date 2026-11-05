@@ -36,5 +36,14 @@ def verify_signature(
     return hmac.compare_digest(expected, sig.lower().strip())
 
 
-def is_chat_allowed(chat_id: int, allowed: frozenset[int]) -> bool:
+def is_chat_allowed(chat_id: int, allowed: frozenset[int], allow_all: bool = False) -> bool:
+    if allow_all:
+        return True
     return chat_id in allowed
+
+
+def check_api_key(provided: str | None, secret: str | None) -> bool:
+    if not provided or not secret:
+        return False
+    return hmac.compare_digest(provided.strip(), secret.strip())
+

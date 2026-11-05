@@ -64,6 +64,7 @@ class Settings:
     request_timeout_seconds: float
     port: int
     log_level: str
+    allow_all_chats: bool = False
 
     @property
     def telegram_configured(self) -> bool:
@@ -78,7 +79,7 @@ def parse_allowed_chat_ids(raw: str | None) -> frozenset[int]:
     ids: set[int] = set()
     for part in raw.split(","):
         part = part.strip()
-        if not part:
+        if not part or part in ("*", "all", "ALL"):
             continue
         try:
             ids.add(int(part))
@@ -104,17 +105,27 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
     if chunk % 4096 != 0:
         raise ConfigError("TELEGRAM_CHUNK_SIZE must be a multiple of 4096")
 
+    raw_allowed = _get(src, "ALLOWED_CHAT_IDS")
+    allow_all = _get_bool(src, "ALLOW_ALL_CHATS", False)
+    if raw_allowed:
+        parts = [p.strip().lower() for p in raw_allowed.split(",") if p.strip()]
+        if "*" in parts or "all" in parts:
+            allow_all = True
+
+    secret = _get(src, "STREAM_SIGNING_SECRET") or _get(src, "GATEWAY_API_KEY") or _get(src, "API_KEY")
+
     return Settings(
         api_id=api_id,
         api_hash=_get(src, "TELEGRAM_API_HASH"),
         bot_token=_get(src, "TELEGRAM_BOT_TOKEN"),
         session_string=_get(src, "TELEGRAM_SESSION_STRING"),
-        allowed_chat_ids=parse_allowed_chat_ids(_get(src, "ALLOWED_CHAT_IDS")),
-        signing_secret=_get(src, "STREAM_SIGNING_SECRET"),
+        allowed_chat_ids=parse_allowed_chat_ids(raw_allowed),
+        signing_secret=secret,
         allow_unsigned=_get_bool(src, "ALLOW_UNSIGNED_STREAMS", False),
         max_concurrent_streams=_get_int(src, "MAX_CONCURRENT_STREAMS", 4, 1),
         telegram_chunk_size=chunk,
         request_timeout_seconds=_get_float(src, "REQUEST_TIMEOUT_SECONDS", 30.0, 1.0),
         port=_get_int(src, "PORT", 8080, 1),
         log_level=(_get(src, "LOG_LEVEL") or "info").lower(),
+        allow_all_chats=allow_all,
     )

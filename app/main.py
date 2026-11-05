@@ -7,10 +7,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import hmac
 import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import telegram_stream
@@ -22,7 +24,7 @@ from .range_parser import (
     parse_range,
     unsatisfiable_value,
 )
-from .security import is_chat_allowed, verify_signature
+from .security import check_api_key, is_chat_allowed, verify_signature
 
 log = logging.getLogger("gateway")
 
@@ -67,30 +69,66 @@ def _error(status: int, message: str) -> JSONResponse:
     return JSONResponse({"ok": False, "error": message}, status_code=status)
 
 
+def _extract_api_key(request: Request) -> str | None:
+    hdr = request.headers.get("x-api-key")
+    if hdr:
+        return hdr.strip()
+    auth = request.headers.get("authorization")
+    if auth and auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    query_key = request.query_params.get("api_key") or request.query_params.get("token")
+    if query_key:
+        return query_key.strip()
+    return None
+
+
 def _check_auth(settings: Settings, chat_id: int, message_id: int, request: Request) -> JSONResponse | None:
-    if not is_chat_allowed(chat_id, settings.allowed_chat_ids):
+    api_key = _extract_api_key(request)
+    if api_key and settings.signing_secret and hmac.compare_digest(api_key, settings.signing_secret):
+        return None
+
+    if not is_chat_allowed(chat_id, settings.allowed_chat_ids, allow_all=settings.allow_all_chats):
         return _error(403, "chat not allowed")
     if settings.allow_unsigned:
         return None
     if not settings.signing_secret:
         return _error(503, "signing not configured")
+
+    raw_exp = request.query_params.get("exp", "")
+    sig = request.query_params.get("sig", "")
+    if not raw_exp or not sig:
+        return _error(401, "unauthorized: missing api_key or exp/sig")
+
     try:
-        exp = int(request.query_params.get("exp", ""))
+        exp = int(raw_exp)
     except ValueError:
         return _error(403, "invalid exp")
-    sig = request.query_params.get("sig", "")
+
     if not verify_signature(chat_id, message_id, exp, sig, settings.signing_secret):
         return _error(403, "invalid or expired signature")
     return None
 
 
-def _base_headers(info: object, size: int) -> dict[str, str]:
+def _check_chat_access(settings: Settings, chat_id: int, request: Request) -> JSONResponse | None:
+    api_key = _extract_api_key(request)
+    if api_key and settings.signing_secret and hmac.compare_digest(api_key, settings.signing_secret):
+        return None
+    if not is_chat_allowed(chat_id, settings.allowed_chat_ids, allow_all=settings.allow_all_chats):
+        return _error(403, "chat not allowed")
+    return None
+
+
+def _base_headers(info: object, size: int, as_attachment: bool = False) -> dict[str, str]:
+    fname = getattr(info, "filename", "video.bin")
+    disposition = "attachment" if as_attachment else "inline"
     return {
         "Accept-Ranges": "bytes",
         "Content-Type": getattr(info, "mime_type", "application/octet-stream"),
-        "Content-Disposition": f'inline; filename="{getattr(info, "filename", "video.bin")}"',
+        "Content-Disposition": f'{disposition}; filename="{fname}"',
         "ETag": f'"{abs(hash((getattr(info, "filename", ""), size))) % 10**12}-{size}"',
         "Cache-Control": "private, max-age=3600",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges, ETag",
     }
 
 
@@ -136,6 +174,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 log.warning("disconnect failed: %s", type(e).__name__)
 
     app = FastAPI(title="telegram-stream-gateway", lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["Content-Range", "Accept-Ranges", "Content-Length", "ETag"],
+    )
 
     from .r2_mirror import MirrorManager, object_key, r2_settings_from_env
 
@@ -146,9 +192,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         connected = holder["client"] is not None
         return {
             "ok": True,
+            "version": "2.0.0",
+            "service": "telegram-stream-gateway",
             "telegram_connected": connected,
             "telegram_configured": cfg.telegram_configured,
+            "allow_all_chats": cfg.allow_all_chats,
+            "allowed_chat_count": len(cfg.allowed_chat_ids),
         }
+
+    @app.get("/v1/chats")
+    async def list_chats(request: Request):
+        api_key = _extract_api_key(request)
+        if not (cfg.allow_unsigned or (api_key and cfg.signing_secret and hmac.compare_digest(api_key, cfg.signing_secret))):
+            return _error(401, "unauthorized: api_key required to list chats")
+        if not cfg.telegram_configured:
+            return _error(503, "telegram not configured")
+        try:
+            client = await _get_client(cfg, holder)
+            dialogs = await client.get_dialogs(limit=100)
+            chats = []
+            for d in dialogs:
+                entity = d.entity
+                chats.append({
+                    "id": d.id,
+                    "title": d.title or getattr(entity, "first_name", "") or str(d.id),
+                    "username": getattr(entity, "username", None),
+                    "type": "channel" if getattr(entity, "broadcast", False) else ("megagroup" if getattr(entity, "megagroup", False) else "chat"),
+                    "unread_count": d.unread_count,
+                })
+            return JSONResponse({"ok": True, "count": len(chats), "chats": chats})
+        except Exception as e:
+            log.error("list_chats failed: %s", type(e).__name__)
+            return _error(502, f"telegram error: {e}")
 
     @app.post("/v1/cache/{chat_id}/{message_id}")
     async def cache_trigger(chat_id: int, message_id: int, request: Request):
@@ -202,6 +277,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return None, _error(404, "video not found")
         return (client, media), None
 
+    @app.get("/v1/info/{chat_id}/{message_id}")
+    async def get_info(chat_id: int, message_id: int, request: Request):
+        denied = _check_auth(cfg, chat_id, message_id, request)
+        if denied is not None:
+            return denied
+        resolved, err = await _media_or_error(chat_id, message_id)
+        if err is not None:
+            return err
+        _, media = resolved
+        return JSONResponse({
+            "ok": True,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "filename": media.filename,
+            "size": media.size,
+            "mime_type": media.mime_type,
+            "caption": getattr(media, "caption", ""),
+            "date": getattr(media, "date", 0),
+            "stream_url": f"/v1/stream/{chat_id}/{message_id}",
+            "file_url": f"/v1/file/{chat_id}/{message_id}",
+            "thumb_url": f"/v1/thumb/{chat_id}/{message_id}",
+        })
+
     @app.head("/v1/video/{chat_id}/{message_id}")
     async def video_head(chat_id: int, message_id: int, request: Request):
         denied = _check_auth(cfg, chat_id, message_id, request)
@@ -231,13 +329,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             semaphore.release()
 
-    async def _stream_response(request: Request, chat_id: int, message_id: int, cfg: Settings, holder: dict):
+    @app.head("/v1/stream/{chat_id}/{message_id}")
+    async def stream_head(chat_id: int, message_id: int, request: Request):
+        return await video_head(chat_id, message_id, request)
+
+    @app.get("/v1/stream/{chat_id}/{message_id}")
+    async def stream_get(chat_id: int, message_id: int, request: Request):
+        return await video_get(chat_id, message_id, request)
+
+    @app.head("/v1/file/{chat_id}/{message_id}")
+    async def file_head(chat_id: int, message_id: int, request: Request):
+        denied = _check_auth(cfg, chat_id, message_id, request)
+        if denied is not None:
+            return denied
+        resolved, err = await _media_or_error(chat_id, message_id)
+        if err is not None:
+            return err
+        _, media = resolved
+        headers = _base_headers(media, media.size, as_attachment=True)
+        headers["Content-Length"] = str(media.size)
+        return JSONResponse(None, status_code=200, headers=headers)
+
+    @app.get("/v1/file/{chat_id}/{message_id}")
+    async def file_get(chat_id: int, message_id: int, request: Request):
+        denied = _check_auth(cfg, chat_id, message_id, request)
+        if denied is not None:
+            return denied
+        try:
+            acquired = await asyncio.wait_for(semaphore.acquire(), timeout=10.0)
+        except asyncio.TimeoutError:
+            return _error(503, "server busy")
+        if not acquired:
+            return _error(503, "server busy")
+        try:
+            return await _stream_response(request, chat_id, message_id, cfg, holder, as_attachment=True)
+        finally:
+            semaphore.release()
+
+    async def _stream_response(
+        request: Request,
+        chat_id: int,
+        message_id: int,
+        cfg: Settings,
+        holder: dict,
+        as_attachment: bool = False,
+    ):
         resolved, err = await _media_or_error(chat_id, message_id)
         if err is not None:
             return err
         client, media = resolved
         size = media.size
-        base = _base_headers(media, size)
+        base = _base_headers(media, size, as_attachment=as_attachment)
 
         raw_range = request.headers.get("range")
         try:
@@ -289,40 +431,72 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers["Content-Range"] = content_range_value(wanted, size)
         return StreamingResponse(body(), status_code=status, headers=headers)
 
-    _feed_cache: dict[int, tuple[float, dict]] = {}
+    _feed_cache: dict[tuple[int, int, int, str], tuple[float, dict]] = {}
+    _poster_cache: dict[tuple[int, int], int] = {}
     _thumb_cache: dict[tuple[int, int], tuple[float, bytes]] = {}
 
     @app.get("/v1/feed/{chat_id}")
-    async def get_feed(chat_id: int):
-        if not is_chat_allowed(chat_id, cfg.allowed_chat_ids):
-            return _error(403, "chat not allowed")
+    async def get_feed(
+        chat_id: int,
+        request: Request,
+        limit: int = 100,
+        offset_id: int = 0,
+        type: str = "video",
+    ):
+        denied = _check_chat_access(cfg, chat_id, request)
+        if denied is not None:
+            return denied
+        limit = max(1, min(limit, 200))
+        media_filter = type.lower().strip()
+        cache_key = (chat_id, limit, offset_id, media_filter)
         now = time.time()
-        cached = _feed_cache.get(chat_id)
+        cached = _feed_cache.get(cache_key)
         if cached and cached[0] > now:
             return JSONResponse(cached[1])
         try:
             client = await _get_client(cfg, holder)
             entity = await client.get_entity(chat_id)
-            msgs = await client.get_messages(entity, limit=100)
+            kwargs = {"limit": limit}
+            if offset_id > 0:
+                kwargs["offset_id"] = offset_id
+            msgs = await client.get_messages(entity, **kwargs)
         except Exception as e:
             log.error("feed fetch failed: %s", type(e).__name__)
             return _error(502, "telegram unavailable")
 
         pending_photos = {}
-        videos = []
+        filtered_msgs = []
         for m in msgs:
-            if getattr(m, "photo", None):
+            is_photo = bool(getattr(m, "photo", None))
+            doc = getattr(m, "document", None)
+            mime = getattr(doc, "mime_type", "") if doc else ""
+            is_video = bool(getattr(m, "video", None)) or (doc is not None and "video" in mime)
+            is_audio = bool(getattr(m, "audio", None)) or (doc is not None and "audio" in mime)
+            is_doc = bool(doc is not None)
+
+            if is_photo:
                 if getattr(m, "grouped_id", None):
                     pending_photos[m.grouped_id] = m.id
                 pending_photos[int(m.date.timestamp())] = m.id
-            elif getattr(m, "video", None) or (getattr(m, "document", None) and "video" in getattr(m.document, "mime_type", "")):
-                videos.append(m)
+
+            match = False
+            if media_filter == "video" and is_video:
+                match = True
+            elif media_filter == "audio" and is_audio:
+                match = True
+            elif media_filter == "photo" and is_photo:
+                match = True
+            elif media_filter in ("all", "any", "file", "*") and (is_video or is_audio or is_doc or is_photo):
+                match = True
+
+            if match:
+                filtered_msgs.append(m)
 
         items = []
-        for m in videos:
+        for m in filtered_msgs:
             cap = (m.message or "").strip()
             lines = cap.split("\n")
-            title = lines[0].strip() if lines and lines[0].strip() else f"Video {m.date.strftime('%d/%m/%Y')}"
+            title = lines[0].strip() if lines and lines[0].strip() else f"Media {m.date.strftime('%d/%m/%Y')}"
             desc = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
 
             poster_mid = None
@@ -335,26 +509,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         poster_mid = pid
                         break
 
+            if poster_mid:
+                _poster_cache[(chat_id, m.id)] = poster_mid
+
+            doc = getattr(m, "document", None)
+            mime = getattr(doc, "mime_type", "") if doc else ("image/jpeg" if getattr(m, "photo", None) else "")
+            size = getattr(doc, "size", 0) if doc else 0
+            fname = telegram_stream._document_filename(doc, f"{m.id}.bin") if doc else None
+            m_type = "video" if (getattr(m, "video", None) or "video" in mime) else (
+                "audio" if (getattr(m, "audio", None) or "audio" in mime) else ("photo" if getattr(m, "photo", None) else "file")
+            )
+
             items.append({
                 "mid": m.id,
                 "title": title,
                 "desc": desc,
                 "date": int(m.date.timestamp()),
-                "duration": getattr(m.video, "duration", 0) if getattr(m, "video", None) else 0,
+                "duration": getattr(m.video, "duration", 0) if getattr(m, "video", None) else (
+                    getattr(m.audio, "duration", 0) if getattr(m, "audio", None) else 0
+                ),
+                "type": m_type,
+                "size": size,
+                "mime_type": mime,
+                "filename": fname,
                 "stream": f"/api/play?mid={m.id}",
+                "stream_url": f"/v1/stream/{chat_id}/{m.id}",
+                "file_url": f"/v1/file/{chat_id}/{m.id}",
                 "thumb": f"/api/thumb?mid={m.id}" + ("&v=p" if poster_mid else ""),
+                "thumb_url": f"/v1/thumb/{chat_id}/{m.id}",
                 "has_poster": bool(poster_mid),
                 "poster_mid": poster_mid,
             })
 
         feed_data = {"ok": True, "configured": True, "count": len(items), "items": items}
-        _feed_cache[chat_id] = (now + 60.0, feed_data)
+        _feed_cache[cache_key] = (now + 60.0, feed_data)
         return JSONResponse(feed_data)
 
     @app.get("/v1/thumb/{chat_id}/{message_id}")
-    async def get_thumb(chat_id: int, message_id: int):
-        if not is_chat_allowed(chat_id, cfg.allowed_chat_ids):
-            return _error(403, "chat not allowed")
+    async def get_thumb(chat_id: int, message_id: int, request: Request):
+        denied = _check_chat_access(cfg, chat_id, request)
+        if denied is not None:
+            return denied
         key = (chat_id, message_id)
         now = time.time()
         cached = _thumb_cache.get(key)
@@ -367,13 +562,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             client = await _get_client(cfg, holder)
             entity = await client.get_entity(chat_id)
-            target_id = message_id
-            feed_cached = _feed_cache.get(chat_id)
-            if feed_cached:
-                for it in feed_cached[1].get("items", []):
-                    if it.get("mid") == message_id and it.get("poster_mid"):
-                        target_id = it["poster_mid"]
-                        break
+            target_id = _poster_cache.get((chat_id, message_id), message_id)
             msg = await client.get_messages(entity, ids=target_id)
             if not msg:
                 return _error(404, "not found")
@@ -384,7 +573,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     img_bytes = await client.download_media(orig_msg, thumb=-1, file=bytes)
             if not img_bytes:
                 return _error(404, "no thumbnail")
-            if len(_thumb_cache) > 100:
+            if len(_thumb_cache) > 200:
                 _thumb_cache.clear()
             _thumb_cache[key] = (now + 86400.0, bytes(img_bytes))
             return Response(
@@ -411,5 +600,6 @@ app = create_app(_settings) if _settings is not None else create_app(
         allowed_chat_ids=frozenset(), signing_secret=None, allow_unsigned=False,
         max_concurrent_streams=4, telegram_chunk_size=512 * 1024,
         request_timeout_seconds=30.0, port=8080, log_level="info",
+        allow_all_chats=False,
     )
 )

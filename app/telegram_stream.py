@@ -28,6 +28,8 @@ class CachedMedia:
     mime_type: str
     filename: str
     expires_at: float
+    caption: str = ""
+    date: int = 0
 
     @property
     def fresh(self) -> bool:
@@ -108,6 +110,9 @@ async def _resolve_media(client: object, chat_id: int, message_id: int) -> Cache
     except (TypeError, ValueError):
         return None
     mime = str(getattr(doc, "mime_type", None) or "application/octet-stream")
+    caption = str(getattr(msg, "message", "") or "")
+    msg_date = getattr(msg, "date", None)
+    date_ts = int(msg_date.timestamp()) if msg_date is not None else 0
     return CachedMedia(
         doc_id=doc_id,
         access_hash=access_hash,
@@ -116,6 +121,8 @@ async def _resolve_media(client: object, chat_id: int, message_id: int) -> Cache
         mime_type=mime,
         filename=_document_filename(doc, f"{message_id}.bin"),
         expires_at=time.time() + METADATA_TTL_SECONDS,
+        caption=caption,
+        date=date_ts,
     )
 
 

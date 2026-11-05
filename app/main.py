@@ -11,7 +11,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import telegram_stream
 from .config import ConfigError, Settings, load_settings
@@ -288,6 +288,113 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if status == 206:
             headers["Content-Range"] = content_range_value(wanted, size)
         return StreamingResponse(body(), status_code=status, headers=headers)
+
+    _feed_cache: dict[int, tuple[float, dict]] = {}
+    _thumb_cache: dict[tuple[int, int], tuple[float, bytes]] = {}
+
+    @app.get("/v1/feed/{chat_id}")
+    async def get_feed(chat_id: int):
+        if not is_chat_allowed(chat_id, cfg.allowed_chat_ids):
+            return _error(403, "chat not allowed")
+        now = time.time()
+        cached = _feed_cache.get(chat_id)
+        if cached and cached[0] > now:
+            return JSONResponse(cached[1])
+        try:
+            client = await _get_client(cfg, holder)
+            entity = await client.get_entity(chat_id)
+            msgs = await client.get_messages(entity, limit=100)
+        except Exception as e:
+            log.error("feed fetch failed: %s", type(e).__name__)
+            return _error(502, "telegram unavailable")
+
+        pending_photos = {}
+        videos = []
+        for m in msgs:
+            if getattr(m, "photo", None):
+                if getattr(m, "grouped_id", None):
+                    pending_photos[m.grouped_id] = m.id
+                pending_photos[int(m.date.timestamp())] = m.id
+            elif getattr(m, "video", None) or (getattr(m, "document", None) and "video" in getattr(m.document, "mime_type", "")):
+                videos.append(m)
+
+        items = []
+        for m in videos:
+            cap = (m.message or "").strip()
+            lines = cap.split("\n")
+            title = lines[0].strip() if lines and lines[0].strip() else f"Video {m.date.strftime('%d/%m/%Y')}"
+            desc = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+
+            poster_mid = None
+            if getattr(m, "grouped_id", None) and m.grouped_id in pending_photos:
+                poster_mid = pending_photos[m.grouped_id]
+            else:
+                ts = int(m.date.timestamp())
+                for pts, pid in pending_photos.items():
+                    if abs(pts - ts) <= 900:
+                        poster_mid = pid
+                        break
+
+            items.append({
+                "mid": m.id,
+                "title": title,
+                "desc": desc,
+                "date": int(m.date.timestamp()),
+                "duration": getattr(m.video, "duration", 0) if getattr(m, "video", None) else 0,
+                "stream": f"/api/play?mid={m.id}",
+                "thumb": f"/api/thumb?mid={m.id}" + ("&v=p" if poster_mid else ""),
+                "has_poster": bool(poster_mid),
+                "poster_mid": poster_mid,
+            })
+
+        feed_data = {"ok": True, "configured": True, "count": len(items), "items": items}
+        _feed_cache[chat_id] = (now + 60.0, feed_data)
+        return JSONResponse(feed_data)
+
+    @app.get("/v1/thumb/{chat_id}/{message_id}")
+    async def get_thumb(chat_id: int, message_id: int):
+        if not is_chat_allowed(chat_id, cfg.allowed_chat_ids):
+            return _error(403, "chat not allowed")
+        key = (chat_id, message_id)
+        now = time.time()
+        cached = _thumb_cache.get(key)
+        if cached and cached[0] > now:
+            return Response(
+                content=cached[1],
+                media_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=604800, s-maxage=604800, immutable"},
+            )
+        try:
+            client = await _get_client(cfg, holder)
+            entity = await client.get_entity(chat_id)
+            target_id = message_id
+            feed_cached = _feed_cache.get(chat_id)
+            if feed_cached:
+                for it in feed_cached[1].get("items", []):
+                    if it.get("mid") == message_id and it.get("poster_mid"):
+                        target_id = it["poster_mid"]
+                        break
+            msg = await client.get_messages(entity, ids=target_id)
+            if not msg:
+                return _error(404, "not found")
+            img_bytes = await client.download_media(msg, thumb=-1 if not getattr(msg, "photo", None) else None, file=bytes)
+            if not img_bytes and target_id != message_id:
+                orig_msg = await client.get_messages(entity, ids=message_id)
+                if orig_msg:
+                    img_bytes = await client.download_media(orig_msg, thumb=-1, file=bytes)
+            if not img_bytes:
+                return _error(404, "no thumbnail")
+            if len(_thumb_cache) > 100:
+                _thumb_cache.clear()
+            _thumb_cache[key] = (now + 86400.0, bytes(img_bytes))
+            return Response(
+                content=bytes(img_bytes),
+                media_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=604800, s-maxage=604800, immutable"},
+            )
+        except Exception as e:
+            log.error("thumb fetch failed: %s", type(e).__name__)
+            return _error(502, "telegram unavailable")
 
     return app
 

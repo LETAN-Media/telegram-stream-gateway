@@ -34,13 +34,27 @@ def _client_holder() -> dict:
 
 
 async def _get_client(settings: Settings, holder: dict):
-    if holder["client"] is not None:
+    if holder["client"] is not None and holder["client"].is_connected():
         return holder["client"]
     if holder["lock"] is None:
         holder["lock"] = asyncio.Lock()
     async with holder["lock"]:
         if holder["client"] is not None:
-            return holder["client"]
+            client = holder["client"]
+            if client.is_connected():
+                return client
+            try:
+                await client.connect()
+                if not await client.is_user_authorized():
+                    raise RuntimeError("Telegram session is not authorized")
+                return client
+            except Exception:
+                holder["client"] = None
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                raise
         client = await _connect(settings, holder)
         holder["client"] = client
         return client
@@ -189,7 +203,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/healthz")
     async def healthz():
-        connected = holder["client"] is not None
+        connected = holder["client"] is not None and holder["client"].is_connected()
         return {
             "ok": True,
             "version": "2.0.0",
@@ -251,7 +265,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             client = await _get_client(cfg, holder)
         except Exception:
             return _error(502, "telegram unavailable")
-        media = await telegram_stream.get_cached_media(client, chat_id, message_id)
+        try:
+            media = await telegram_stream.get_cached_media(client, chat_id, message_id)
+        except (ConnectionError, OSError):
+            log.warning("Telegram connection unavailable while resolving media")
+            return _error(503, "telegram unavailable")
         if media is None:
             return _error(404, "video not found")
         key = object_key(chat_id, message_id)
@@ -272,7 +290,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception as e:
             log.error("telegram connect failed: %s", type(e).__name__)
             return None, _error(502, "telegram unavailable")
-        media = await telegram_stream.get_cached_media(client, chat_id, message_id)
+        try:
+            media = await telegram_stream.get_cached_media(client, chat_id, message_id)
+        except (ConnectionError, OSError):
+            log.warning("Telegram connection unavailable while resolving media")
+            return None, _error(503, "telegram unavailable")
         if media is None:
             return None, _error(404, "video not found")
         return (client, media), None

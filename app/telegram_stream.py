@@ -89,11 +89,15 @@ async def _resolve_media(client: object, chat_id: int, message_id: int) -> Cache
         entity = await client.get_entity(chat_id)
     except Exception as e:
         log.warning("get_entity failed chat=%s: %s", chat_id, type(e).__name__)
+        if not client.is_connected():
+            raise ConnectionError("Telegram disconnected") from e
         return None
     try:
         msg = await client.get_messages(entity, ids=message_id)
     except Exception as e:
         log.warning("get_messages failed: %s", type(e).__name__)
+        if not client.is_connected():
+            raise ConnectionError("Telegram disconnected") from e
         return None
     if msg is None:
         return None
